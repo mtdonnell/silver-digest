@@ -1,0 +1,37 @@
+services:
+  silver-report:
+    build: .
+    image: silver-report:latest
+    container_name: silver-report
+    restart: unless-stopped
+
+    # Credentials arrive at runtime, never in the image.
+    # NOTE: docker compose does not interpolate inside env_file, so a password
+    # containing $ is passed through literally. Do not wrap values in quotes
+    # here -- unlike a shell, the quotes would become part of the value.
+    env_file: .env
+
+    environment:
+      # IANA zone name, not an offset -- Chicago is UTC-5 in summer and UTC-6
+      # in winter, so a hardcoded offset drifts by an hour half the year.
+      TZ: America/Chicago
+      RUN_AT: "03:15"
+      DATA_DIR: /data
+      # Flip to "true" for the first run so you get a digest immediately
+      # instead of waiting until 3:15am to find out it works.
+      RUN_ON_START: "false"
+
+    volumes:
+      # history.csv, exports/, failures/ and the log. Everything you care
+      # about keeping lives on the host side of this mount.
+      - ./data:/data
+
+    # Chromium will crash on the default 64MB of /dev/shm under any real page.
+    # This is the single most common "works locally, dies in Docker" cause.
+    shm_size: "1gb"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

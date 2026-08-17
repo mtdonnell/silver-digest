@@ -1,0 +1,17 @@
+# Credentials. Never commit this.
+.env
+
+# Runtime output
+data/
+history.csv
+last_raw.json
+silver_report.log
+exports/
+failures/
+recon_output/
+
+.venv/
+__pycache__/
+*.pyc
+HOMELAB.md
+.claude/

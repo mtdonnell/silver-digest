@@ -1,0 +1,9 @@
+# The Docker image pins these too -- keep the playwright version here in sync
+# with the base image tag in Dockerfile, or the driver and the browser
+# binaries will not match.
+playwright==1.58.0
+
+# Needed for zoneinfo to resolve TZ=America/Chicago on systems without a
+# system tz database (notably Windows). Harmless on Linux, where the
+# Dockerfile installs the OS tzdata package instead.
+tzdata

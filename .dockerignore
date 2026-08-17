@@ -1,0 +1,22 @@
+# Credentials must never enter the build context. Even a COPY that is later
+# removed leaves them readable in the image history.
+.env
+*.env
+!env.example
+
+# Runtime output -- lives in the bind-mounted ./data on the host.
+data/
+history.csv
+last_raw.json
+*.log
+exports/
+failures/
+recon_output/
+
+# Local dev junk
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+README.md

@@ -419,6 +419,9 @@ class Store:
     name: str
     username: str
     password: str
+    # "STORE2" etc. -- the .env prefix, so a rotated password can be written
+    # back to the right line.
+    key: str = ""
 
 
 @dataclass
@@ -455,6 +458,7 @@ def get_stores() -> list[Store]:
             name=os.environ.get(f"STORE{i}_NAME", f"Store {i}"),
             username=user,
             password=os.environ[f"STORE{i}_PASS"],
+            key=f"STORE{i}",
         ))
     if not stores:
         raise SystemExit("No stores configured. Copy .env.example to .env and fill it in.")
@@ -469,13 +473,286 @@ MONEY = re.compile(r"-?\$?\s*-?[\d,]+\.?\d{0,2}")
 
 
 def login(page: Page, store: Store) -> None:
+    """
+    Log in, rotating the password first if Silver says it has expired.
+
+    An expired password does NOT fail the login. Silver accepts it and then
+    opens a modal "Change Password" form, and the report menu never appears.
+    Before this was handled, that showed up only as a 45s timeout on
+    "text=Results" (De Soto, 2026-10-14), so the cause had to be read off the
+    failure screenshot.
+    """
+    _refresh_password(store)
+    state = _submit_login(page, store, store.password)
+
+    if state == "timeout" and store.key:
+        # A rotation that died after Save but before the new password was
+        # promoted leaves it in STORE<n>_PASS_PENDING, and the old one is now
+        # rejected. Try it once before giving up.
+        pending = _read_env_file().get(f"{store.key}_PASS_PENDING")
+        if pending and pending != store.password:
+            log.warning("[%s] login failed -- trying the pending password "
+                        "from an unfinished rotation", store.name)
+            state = _submit_login(page, store, pending)
+            if state != "timeout":
+                _set_env_values({f"{store.key}_PASS": pending,
+                                 f"{store.key}_PASS_PENDING": None})
+                store.password = pending
+                log.info("[%s] pending password works -- promoted", store.name)
+
+    if state == "change_password":
+        rotate_password(page, store)
+        state = _submit_login(page, store, store.password)
+        if state != "ok":
+            raise RuntimeError(f"password rotated, but logging in with the new "
+                               f"one ended in {state!r}")
+    elif state != "ok":
+        raise RuntimeError("login did not reach the Results menu within 45s "
+                           "(wrong password, or the portal changed)")
+    log.info("[%s] logged in", store.name)
+
+
+# The forced-change modal. ids are author-assigned ExtJS ids (stable), read
+# off the 2026-10-14 failure snapshot.
+CHANGE_PW = {
+    "username": "#changepassword_membershipusername-inputEl",
+    "old":      "#changepassword_OldPassword-inputEl",
+    "new":      "#changepassword_Password-inputEl",
+    "confirm":  "#changepassword_ConfirmPassword-inputEl",
+    "save":     "#changepassword_changePasswordSaveButton-btnEl",
+}
+ENVFILE = HERE / ".env"
+ROTATE_DRY_RUN = False
+
+
+def _submit_login(page: Page, store: Store, password: str) -> str:
+    """Returns "ok", "change_password" or "timeout"."""
     log.info("[%s] opening login page", store.name)
     page.goto(SELECTORS["login_url"], wait_until="load", timeout=60_000)
     page.fill(SELECTORS["username_field"], store.username)
-    page.fill(SELECTORS["password_field"], store.password)
+    page.fill(SELECTORS["password_field"], password)
     page.click(SELECTORS["login_button"])
-    page.wait_for_selector(SELECTORS["login_success"], timeout=45_000)
-    log.info("[%s] logged in", store.name)
+    results = page.locator(f"{SELECTORS['login_success']} >> visible=true")
+    modal = page.locator(f"{CHANGE_PW['old']} >> visible=true")
+    deadline = datetime.now() + timedelta(seconds=45)
+    while datetime.now() < deadline:
+        if modal.count():
+            log.warning("[%s] Silver is forcing a password change", store.name)
+            return "change_password"
+        if results.count():
+            return "ok"
+        page.wait_for_timeout(500)
+    return "timeout"
+
+
+def _read_env_file() -> dict[str, str]:
+    """The .env as it is on disk NOW. The Telegram bot is long-running, so its
+    os.environ can hold a password the timer job has since rotated."""
+    out: dict[str, str] = {}
+    if not ENVFILE.exists():
+        return out
+    for line in ENVFILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _refresh_password(store: Store) -> None:
+    if store.key:
+        current = _read_env_file().get(f"{store.key}_PASS")
+        if current:
+            store.password = current
+
+
+def _set_env_values(updates: dict[str, str | None]) -> None:
+    """
+    Replace, add or (value None) remove keys in .env, atomically.
+
+    A timestamped copy of the previous file is kept next to it first (newest
+    10), because a half-written .env after a rotation would lock the job out
+    of an account whose password no human knows.
+    """
+    import shutil
+    text = ENVFILE.read_text(encoding="utf-8")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup = ENVFILE.with_name(f".env.bak-{stamp}")
+    shutil.copy2(ENVFILE, backup)
+    os.chmod(backup, 0o600)
+    for old in sorted(HERE.glob(".env.bak-*"))[:-10]:
+        old.unlink()
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k = s.split("=", 1)[0].strip()
+            if k in updates:
+                seen.add(k)
+                if updates[k] is not None:
+                    out.append(f"{k}={updates[k]}")
+                continue
+        out.append(line)
+    for k, v in updates.items():
+        if k not in seen and v is not None:
+            out.append(f"{k}={v}")
+
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(HERE), prefix=".env.tmp-")
+    try:
+        os.chmod(tmp, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(out) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, ENVFILE)
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
+    for k, v in updates.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+def generate_password(length: int = 20) -> str:
+    """Random, with every character class, and nothing a .env line or a shell
+    could mangle (no quotes, spaces, $, # or backslash). The form caps at 32."""
+    import secrets
+    import string
+    symbols = "!@%^*-_+."
+    alphabet = string.ascii_letters + string.digits + symbols
+    while True:
+        pw = "".join(secrets.choice(alphabet) for _ in range(length))
+        if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
+                and any(c.isdigit() for c in pw)
+                and any(c in symbols for c in pw)):
+            return pw
+
+
+def _modal_errors(page: Page) -> str:
+    """The form's own validation text (ExtJS keeps it in data-errorqtip) plus
+    any message box, for the log. Never includes field values."""
+    bits: list[str] = []
+    for key in ("old", "new", "confirm"):
+        tip = page.locator(CHANGE_PW[key]).get_attribute("data-errorqtip") or ""
+        tip = re.sub(r"<[^>]+>", " ", tip).strip()
+        if tip:
+            bits.append(f"{key}: {tip}")
+    box = page.locator(".x-message-box >> visible=true")
+    if box.count():
+        bits.append("message: " + " ".join(box.first.inner_text().split()))
+    return "; ".join(bits) or "no message shown"
+
+
+def rotate_password(page: Page, store: Store) -> None:
+    """
+    Complete Silver's forced password change with a generated password.
+
+    Order matters more than anything else here. The new password goes into
+    .env as STORE<n>_PASS_PENDING BEFORE Save is clicked, so a crash at any
+    point leaves it recoverable (login() tries PENDING when the main one
+    fails). It only becomes STORE<n>_PASS after a fresh login with it works.
+    The password itself is never logged or sent anywhere.
+    """
+    if not store.key:
+        raise RuntimeError("password expired, and this store has no .env key "
+                           "to write a new one to")
+    import fcntl
+    with open(DATA / ".rotate.lock", "w") as lockfh:
+        # Both timers and the bot can log in; two rotations at once would
+        # each invalidate the other's password.
+        fcntl.flock(lockfh, fcntl.LOCK_EX)
+        on_disk = _read_env_file().get(f"{store.key}_PASS")
+        if on_disk and on_disk != store.password:
+            raise RuntimeError("another run rotated this password while we "
+                               "waited -- the next run will use the new one")
+
+        new = generate_password()
+        _set_env_values({f"{store.key}_PASS_PENDING": new})
+        log.info("[%s] new password saved as pending; filling the form",
+                 store.name)
+
+        user = page.locator(CHANGE_PW["username"])
+        if not (user.input_value() or "").strip():
+            user.fill(store.username)
+            user.press("Tab")
+        for key, value in (("old", store.password), ("new", new),
+                           ("confirm", new)):
+            field_ = page.locator(CHANGE_PW[key])
+            field_.fill(value)
+            field_.press("Tab")   # ExtJS re-validates on blur, not on fill()
+
+        save = page.locator(CHANGE_PW["save"])
+        deadline = datetime.now() + timedelta(seconds=5)
+        while save.get_attribute("disabled") is not None:
+            if datetime.now() > deadline:
+                _set_env_values({f"{store.key}_PASS_PENDING": None})
+                raise RuntimeError("Save stayed disabled on the change-password "
+                                   "form: " + _modal_errors(page))
+            page.wait_for_timeout(250)
+
+        if ROTATE_DRY_RUN:
+            _set_env_values({f"{store.key}_PASS_PENDING": None})
+            raise RuntimeError("dry run: form accepted, Save enabled, not "
+                               "clicked")
+
+        save.click()
+        modal = page.locator(f"{CHANGE_PW['old']} >> visible=true")
+        box = page.locator(".x-message-box >> visible=true")
+        messages: list[str] = []
+        deadline = datetime.now() + timedelta(seconds=30)
+        while datetime.now() < deadline:
+            if box.count():
+                messages.append(" ".join(box.first.inner_text().split()))
+                ok_btn = box.first.locator("text=OK")
+                if ok_btn.count():
+                    ok_btn.first.click()
+                page.wait_for_timeout(500)
+                continue
+            if not modal.count():
+                break
+            page.wait_for_timeout(500)
+        else:
+            # Unknown whether Silver applied it, so PENDING stays: login()
+            # will try it if the old password stops working.
+            raise RuntimeError("change-password form did not close after "
+                               "Save: " + ("; ".join(messages)
+                                           or _modal_errors(page)))
+        if messages:
+            log.info("[%s] Silver said: %s", store.name, "; ".join(messages))
+
+        # Prove it before promoting it: the caller logs in again with it.
+        check = page.context.browser.new_context()
+        try:
+            state = _submit_login(check.new_page(), store, new)
+        finally:
+            check.close()
+        if state != "ok":
+            raise RuntimeError(f"saved a new password but a fresh login with "
+                               f"it ended in {state!r}; it is kept as "
+                               f"{store.key}_PASS_PENDING")
+        _set_env_values({f"{store.key}_PASS": new,
+                         f"{store.key}_PASS_PENDING": None})
+        store.password = new
+        log.warning("[%s] password expired and was rotated (verified)",
+                    store.name)
+
+    try:
+        notify.send_all(
+            f"Silver: {store.name} password rotated",
+            f"{store.name}: Silver forced a password change. A new one was "
+            f"set and verified automatically.",
+            f"{store.name}: Silver forced a password change. A new random "
+            f"password was set and verified automatically. It is in "
+            f"/opt/silver/.env ({store.key}_PASS) on the silver-report box.",
+            True)
+    except Exception as e:   # the rotation worked; a notice failing is minor
+        log.error("could not send the rotation notice: %s", e)
 
 
 FRAME_URL_HINTS = ("Telerik.ReportViewer.axd", "ReportForm.aspx")
@@ -1542,7 +1819,13 @@ def main() -> int:
     ap.add_argument("--items", action="store_true",
                     help="pull Item Sales (reportType=is) instead of Daily "
                          "Summary; prints top items, does not write history")
+    ap.add_argument("--rotate-dry-run", action="store_true",
+                    help="if Silver forces a password change, fill the form "
+                         "and check Save enables, but do not click it")
     args = ap.parse_args()
+
+    global ROTATE_DRY_RUN
+    ROTATE_DRY_RUN = args.rotate_dry_run
 
     if args.telegram_setup:
         return telegram_setup()

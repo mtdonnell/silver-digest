@@ -144,8 +144,10 @@ SELECTORS: dict[str, str] = {
     # portal itself loads. It skips the ExtJS menus AND the date picker, which
     # were the two most fragile things in this file. {day} is filled in with
     # an ISO date. reportType=ds is the Daily Summary.
+    # reportType=ds is Daily Summary / Store Summary. reportType=is is Item
+    # Sales -- confirmed from the live left-nav id reportsHomeis / showPage('is').
     "report_url":      ("https://mystore.ncrvoyix.com/app/Reports/ReportForm.aspx"
-                        "?reportType=ds&containerName=reportDisplay"
+                        "?reportType={report_type}&containerName=reportDisplay"
                         "&startDate={start}&endDate={end}"
                         "&range=true&gridded=no&details=no"
                         "&showModifiers=false&showStoreDetails=false"
@@ -167,6 +169,9 @@ SELECTORS: dict[str, str] = {
     # rendered report. The page nests the report two frames deep, so this is
     # how we tell the report frame apart from the nav shell.
     "report_marker":   "Gross Sales",
+    # Item Sales (reportType=is) does not contain "Gross Sales". Any one of
+    # these in the report frame means the items report actually rendered.
+    "items_report_markers": "Sold Quantity|Net Sales Amount|Item Sales|Avg. Price|Avg Price",
 
     # --- Export: CONFIRMED from recon --------------------------------------
     # Not a menu at all. It is a classic ASP.NET ReportViewer toolbar: a
@@ -417,12 +422,20 @@ class Store:
 
 
 @dataclass
+class ItemSale:
+    name: str
+    qty: float
+    net_sales: float | None = None
+    category: str = ""
+
+
+@dataclass
 class StoreResult:
     store: str
     business_day: str
     ok: bool = False
     metrics: dict[str, str] = field(default_factory=dict)
-    top_items: list[tuple[str, str]] = field(default_factory=list)
+    items: list[ItemSale] = field(default_factory=list)
     raw_text: str = ""
     error: str = ""
     # Which path produced the numbers -- "export" (trustworthy) or "page-text"
@@ -528,7 +541,19 @@ def report_frame(page: Page) -> Frame:
     return page.main_frame
 
 
+def _report_markers(report_type: str) -> list[str]:
+    if report_type == "is":
+        return [m.strip() for m in SELECTORS["items_report_markers"].split("|")
+                if m.strip()]
+    return [SELECTORS["report_marker"]]
+
+
 def open_store_summary(page: Page, start: date, end: date) -> None:
+    open_report(page, start, end, report_type="ds")
+
+
+def open_report(page: Page, start: date, end: date,
+                report_type: str = "ds") -> None:
     """
     Get the report for the range start..end on screen.
 
@@ -541,22 +566,29 @@ def open_store_summary(page: Page, start: date, end: date) -> None:
     date picker -- historically the two most breakable steps. Falls back to
     clicking through the UI if the direct URL does not render, because direct
     navigation may depend on session state the shell sets up first.
+
+    report_type: ds = Daily Summary, is = Item Sales (left-nav showPage('is')).
     """
+    markers = _report_markers(report_type)
     if SELECTORS.get("report_url"):
-        url = SELECTORS["report_url"].format(start=start.isoformat(),
-                                             end=end.isoformat())
+        url = SELECTORS["report_url"].format(
+            report_type=report_type,
+            start=start.isoformat(),
+            end=end.isoformat())
         try:
-            log.info("trying direct report URL for %s..%s",
-                     start.isoformat(), end.isoformat())
+            log.info("trying direct report URL type=%s for %s..%s",
+                     report_type, start.isoformat(), end.isoformat())
             page.goto(url, wait_until="load", timeout=60_000)
             page.wait_for_load_state("networkidle", timeout=30_000)
             frame = report_frame(page)
-            if SELECTORS["report_marker"] in frame.inner_text("body"):
+            body = frame.inner_text("body")
+            if any(m in body for m in markers):
                 log.info("direct report URL worked -- skipped the menus entirely")
                 verify_day_on_page(page, start)
                 return
-            log.warning("direct URL loaded but no report content -- "
-                        "falling back to clicking through the UI")
+            log.warning("direct URL loaded but no report content "
+                        "(looked for %s) -- falling back to clicking through "
+                        "the UI", markers)
         except Exception as e:
             log.warning("direct report URL failed (%s: %s) -- falling back to "
                         "clicking through the UI", type(e).__name__, e)
@@ -641,7 +673,8 @@ def verify_day_on_page(page: Page, day: date) -> None:
     )
 
 
-def download_export(page: Page, store: Store, start: date, end: date) -> pathlib.Path | None:
+def download_export(page: Page, store: Store, start: date, end: date,
+                    kind: str = "ds") -> pathlib.Path | None:
     """
     Click Export > CSV and keep the file.
 
@@ -707,7 +740,8 @@ def download_export(page: Page, store: Store, start: date, end: date) -> pathlib
         suffix = pathlib.Path(download.suggested_filename).suffix or ".csv"
         span = (start.isoformat() if start == end
                 else f"{start.isoformat()}_to_{end.isoformat()}")
-        dest = EXPORTS / f"{span}_{safe}{suffix}"
+        tag = "" if kind == "ds" else f"_{kind}"
+        dest = EXPORTS / f"{span}_{safe}{tag}{suffix}"
         download.save_as(str(dest))
         log.info("[%s] export saved: %s (%d bytes)",
                  store.name, dest.name, dest.stat().st_size)
@@ -807,6 +841,95 @@ def parse_export(path: pathlib.Path) -> dict[str, str]:
     return {}
 
 
+_ITEM_NAME_HEADERS = {
+    "item name", "item", "name", "description", "menu item", "product",
+}
+_ITEM_QTY_HEADERS = {
+    "sold quantity", "qty sold", "quantity sold", "sold qty", "qty",
+    "quantity", "sold",
+}
+_ITEM_SALES_HEADERS = {
+    "net sales amount", "net sales", "sales amount", "amount", "total",
+    "net sales total",
+}
+_ITEM_CAT_HEADERS = {"category", "dept", "department"}
+_ITEM_SKIP_NAMES = {
+    "grand total", "total", "subtotal", "totals", "category total",
+}
+
+
+def _norm_header(cell: str) -> str:
+    return re.sub(r"\s+", " ", cell.replace(".", "").strip().lower())
+
+
+def parse_item_export(path: pathlib.Path) -> list[ItemSale]:
+    """
+    Pull per-item qty / net sales out of an Item Sales CSV.
+
+    Unlike Daily Summary, this parser refuses to guess a headerless layout.
+    The first live export is saved next to the others; if headers are unknown
+    it fails loudly with the header row in the log rather than ranking the
+    wrong column.
+    """
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    rows = list(csv.reader(text.splitlines()))
+    if not rows:
+        return []
+
+    header_i = -1
+    name_j = qty_j = sales_j = cat_j = -1
+    for i, row in enumerate(rows[:15]):
+        norms = [_norm_header(c) for c in row]
+        nj = next((j for j, n in enumerate(norms) if n in _ITEM_NAME_HEADERS), -1)
+        qj = next((j for j, n in enumerate(norms) if n in _ITEM_QTY_HEADERS), -1)
+        if nj < 0 or qj < 0:
+            continue
+        header_i, name_j, qty_j = i, nj, qj
+        sales_j = next((j for j, n in enumerate(norms)
+                        if n in _ITEM_SALES_HEADERS), -1)
+        cat_j = next((j for j, n in enumerate(norms)
+                      if n in _ITEM_CAT_HEADERS), -1)
+        break
+
+    if header_i < 0:
+        preview = ", ".join(_norm_header(c) for c in rows[0][:12] if c.strip())
+        raise RuntimeError(
+            f"Item Sales export had no recognisable header "
+            f"(name + qty columns). First row: {preview or '(empty)'}. "
+            f"File kept at {path}")
+
+    items: list[ItemSale] = []
+    for row in rows[header_i + 1:]:
+        if name_j >= len(row) or qty_j >= len(row):
+            continue
+        name = row[name_j].strip()
+        if not name or _norm_header(name) in _ITEM_SKIP_NAMES:
+            continue
+        qty_raw = clean_number(row[qty_j])
+        try:
+            qty = float(qty_raw) if qty_raw else 0.0
+        except ValueError:
+            continue
+        if qty <= 0:
+            continue
+        net = None
+        if sales_j >= 0 and sales_j < len(row):
+            sraw = clean_number(row[sales_j])
+            try:
+                net = float(sraw) if sraw else None
+            except ValueError:
+                net = None
+        cat = ""
+        if cat_j >= 0 and cat_j < len(row):
+            cat = row[cat_j].strip()
+        items.append(ItemSale(name=name, qty=qty, net_sales=net, category=cat))
+
+    items.sort(key=lambda it: (-it.qty, -(it.net_sales or 0), it.name.lower()))
+    log.info("parsed item export: %d items from header row %d in %s",
+             len(items), header_i, path.name)
+    return items
+
+
 def harvest(page: Page) -> tuple[dict[str, str], str]:
     """
     Pull labelled numbers out of the rendered report.
@@ -904,6 +1027,92 @@ def run_store(store: Store, start: date, end: date,
             ctx.close()
             browser.close()
     return result
+
+
+def run_store_items(store: Store, start: date, end: date,
+                    headless: bool) -> StoreResult:
+    """
+    Item Sales report for start..end. Never writes history.csv -- that file
+    is one row per store per day of Daily Summary totals.
+    """
+    span = (start.isoformat() if start == end
+            else f"{start.isoformat()}..{end.isoformat()}")
+    result = StoreResult(store=store.name, business_day=span)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        ctx = browser.new_context(viewport={"width": 1440, "height": 1000},
+                                  accept_downloads=True)
+        page = ctx.new_page()
+        page.set_default_timeout(30_000)
+        try:
+            login(page, store)
+            open_report(page, start, end, report_type="is")
+            try:
+                result.raw_text = report_frame(page).inner_text("body")
+            except Exception:
+                result.raw_text = ""
+            export = download_export(page, store, start, end, kind="is")
+            if export is None:
+                raise RuntimeError(
+                    "Item Sales export did not download -- the viewer "
+                    "exportUrl was missing or the click path failed")
+            result.export_file = str(export)
+            result.items = parse_item_export(export)
+            result.source = "export"
+            result.ok = True
+            log.info("[%s] captured %d items via export",
+                     store.name, len(result.items))
+        except Exception as e:
+            result.ok = False
+            result.error = f"{type(e).__name__}: {e}"
+            log.error("[%s] ITEMS FAILED: %s", store.name, result.error)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe = re.sub(r"\W+", "_", store.name)
+            try:
+                page.screenshot(path=str(FAILURES / f"{stamp}_{safe}_items.png"),
+                                full_page=True)
+                (FAILURES / f"{stamp}_{safe}_items.html").write_text(
+                    page.content(), encoding="utf-8")
+            except Exception:
+                pass
+        finally:
+            ctx.close()
+            browser.close()
+    return result
+
+
+def build_items_digest(results: list[StoreResult], label: str,
+                       limit: int = 15) -> tuple[str, str]:
+    """Telegram subject + HTML body for a best-sellers pull."""
+    subject = f"Items {label}"
+    lines: list[str] = [f"<b>Items {notify._html_escape(label)}</b>"]
+    any_ok = False
+    for r in results:
+        lines.append("")
+        if not r.ok:
+            lines.append(f"<b>{notify._html_escape(r.store)}</b> — FAILED")
+            lines.append(notify._html_escape(r.error or "unknown error"))
+            continue
+        any_ok = True
+        shown = r.items[:limit]
+        lines.append(f"<b>{notify._html_escape(r.store)}</b> "
+                     f"({len(r.items)} items)")
+        if not shown:
+            lines.append("  (no item sales in this range — "
+                         "open-price / unnamed rings will not appear)")
+            continue
+        block = []
+        for it in shown:
+            qty = f"{it.qty:g}"
+            if it.net_sales is not None:
+                money = f"${it.net_sales:,.2f}"
+                block.append(f"{qty:>6}  {money:>10}  {it.name}")
+            else:
+                block.append(f"{qty:>6}  {it.name}")
+        lines.append("<pre>" + notify._html_escape("\n".join(block)) + "</pre>")
+    if not any_ok:
+        subject = "[CHECK] " + subject
+    return subject, "\n".join(lines)
 
 
 # ===========================================================================
@@ -1330,6 +1539,9 @@ def main() -> int:
     ap.add_argument("--quiet-unless-failed", action="store_true",
                     help="write history but only send a message if something "
                          "broke (used by the 3:15am retry run)")
+    ap.add_argument("--items", action="store_true",
+                    help="pull Item Sales (reportType=is) instead of Daily "
+                         "Summary; prints top items, does not write history")
     args = ap.parse_args()
 
     if args.telegram_setup:
@@ -1350,7 +1562,18 @@ def main() -> int:
     else:
         day = date.today() - timedelta(days=1)
 
-    log.info("=== run for business day %s ===", day)
+    log.info("=== run for business day %s%s ===",
+             day, " (items)" if args.items else "")
+
+    if args.items:
+        results = [run_store_items(s, day, day, headless=not args.show)
+                   for s in get_stores()]
+        subject, body = build_items_digest(results, day.isoformat())
+        print(re.sub(r"<[^>]+>", "", body))
+        for r in results:
+            if not r.ok:
+                return 1
+        return 0
 
     results = [run_store(s, day, day, headless=not args.show)
                for s in get_stores()]

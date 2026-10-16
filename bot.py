@@ -2,10 +2,10 @@
 """
 bot.py  --  Ask the Telegram bot for sales figures over any date range.
 
-    /sales January 2025
-    /sales last month
-    /sales 2025-01-01 to 2025-01-31
-    /sales yesterday
+    !sales today
+    !sales last week
+    !sales last 10 days
+    !items last 7 days
 
 Why this can work at all: the portal's report URL takes a startDate and an
 endDate, so one day and one whole month cost the same single request. The
@@ -45,22 +45,31 @@ OFFSET_FILE = sr.DATA / "bot_offset.txt"
 MONTHS = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 MONTHS.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
 
-HELP = """<b>Sales lookup</b>
+HELP = """<b>Sales</b>  (!sales or /sales)
 
-<pre>/sales January 2025
-/sales jan 2025
-/sales 2025-01
-/sales last month
-/sales this month
-/sales last week
-/sales yesterday
-/sales 2025-01-15
-/sales 2025-01-01 to 2025-01-31</pre>
+<pre>!sales
+!sales today
+!sales yesterday
+!sales last week
+!sales last 7 days
+!sales last 10 days
+!sales this month
+!sales last month
+!sales ytd</pre>
 
-Any range works — the report is pulled live from the Back Office, so a single
-day and a whole year cost the same one request. Give it 20-30 seconds.
+Bare <code>!sales</code> is today. Give it 20-30 seconds.
 
-<b>/history</b> — what's in the local history file
+<b>Items</b>  (!items or !bestsellers)
+
+<pre>!items
+!items last 7 days
+!items last week
+!items yesterday</pre>
+
+Name, qty sold, and dollars. Same date phrases as sales. Items you rang as
+open-price / unnamed will not show — only what is in the item list.
+
+<b>/history</b> — local daily totals
 <b>/help</b> — this message"""
 
 
@@ -111,6 +120,15 @@ def parse_range(text: str, today: date) -> tuple[date, date, str] | None:
     if t == "last year":
         y = today.year - 1
         return date(y, 1, 1), date(y, 12, 31), str(y)
+
+    # rolling window: "last 10 days", "past 7d", "last 10"
+    m = re.fullmatch(r"(?:last|past|previous)\s+(\d+)\s*(?:d|day|days)?", t)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 366:
+            s = today - timedelta(days=n - 1)
+            return s, today, f"last {n} day{'s' if n != 1 else ''}"
+        return None
 
     # explicit range: "2025-01-01 to 2025-01-31"  (also accepts .. and -)
     m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\s*(?:to|\.\.|through|-)\s*(\d{4}-\d{2}-\d{2})", t)
@@ -210,6 +228,32 @@ def do_sales(chat_id: str, start: date, end: date, label: str) -> None:
         })
 
 
+_ITEMS_FILLER = re.compile(
+    r"^(?:best\s*sellers?|bestsellers|top(?:\s+\d+)?)\s+", re.I)
+
+
+def do_items(chat_id: str, start: date, end: date, label: str) -> None:
+    span_days = (end - start).days + 1
+    reply(chat_id, f"Pulling items for <b>{label}</b> ({span_days} day"
+                   f"{'s' if span_days != 1 else ''})… 20-30s.")
+    stores = sr.get_stores()
+    results = []
+    for store in stores:
+        try:
+            results.append(sr.run_store_items(store, start, end, headless=True))
+        except Exception as e:
+            log.error("bot items: %s failed: %s", store.name, e)
+            results.append(sr.StoreResult(
+                store=store.name, business_day=f"{start}..{end}",
+                ok=False, error=f"{type(e).__name__}: {e}"))
+    subject, body = sr.build_items_digest(results, label)
+    for chunk in notify._telegram_chunks(subject, body):
+        notify.telegram_call("sendMessage", {
+            "chat_id": chat_id, "text": chunk,
+            "parse_mode": "HTML", "disable_web_page_preview": "true",
+        })
+
+
 def do_history(chat_id: str) -> None:
     import csv
     if not sr.HISTORY.exists():
@@ -250,7 +294,7 @@ def handle(msg: dict) -> None:
         return
 
     cmd, _, rest = text.partition(" ")
-    cmd = cmd.lower().lstrip("/").split("@")[0]     # tolerate /sales@BotName
+    cmd = cmd.lower().lstrip("/!").split("@")[0]    # /sales or !sales
     rest = rest.strip()
     log.info("command %r args %r from %s", cmd, rest, chat)
 
@@ -258,22 +302,27 @@ def handle(msg: dict) -> None:
         reply(chat, HELP)
     elif cmd == "history":
         do_history(chat)
-    elif cmd == "sales":
-        if not rest:
-            reply(chat, "Which period? e.g. <code>/sales January 2025</code>")
-            return
-        parsed = parse_range(rest, date.today())
-        if not parsed:
-            reply(chat, f"Couldn't read {notify._html_escape(rest)!r} as a date "
-                        f"range.\n\n{HELP}")
-            return
-        start, end, label = parsed
-        if start > date.today():
-            reply(chat, "That range is in the future.")
-            return
-        do_sales(chat, start, end, label)
+    elif cmd in ("sales", "sale"):
+        _run_dated(chat, rest, do_sales, default="today")
+    elif cmd in ("items", "item", "bestsellers", "bestseller", "best"):
+        rest = _ITEMS_FILLER.sub("", rest).strip()
+        _run_dated(chat, rest, do_items, default="today")
     else:
         reply(chat, f"Unknown command {notify._html_escape(cmd)!r}.\n\n{HELP}")
+
+
+def _run_dated(chat: str, rest: str, fn, default: str) -> None:
+    phrase = rest or default
+    parsed = parse_range(phrase, date.today())
+    if not parsed:
+        reply(chat, f"Couldn't read {notify._html_escape(phrase)!r} as a date "
+                    f"range.\n\n{HELP}")
+        return
+    start, end, label = parsed
+    if start > date.today():
+        reply(chat, "That range is in the future.")
+        return
+    fn(chat, start, end, label)
 
 
 # ===========================================================================

@@ -198,13 +198,16 @@ why the variable count must never vary between sends.
 Run `bot.py` as a service and message it:
 
 ```
-/sales January 2025          /sales 2025-01
-/sales last month            /sales this month
-/sales last week             /sales yesterday
-/sales 2025-01-15            /sales 2025-01-01 to 2025-01-31
-/sales last year             /sales ytd
+!sales                       !sales today
+!sales yesterday             !sales last week
+!sales last 7 days           !sales last 10 days
+!sales this month            !sales ytd
+!items                       !items last 7 days
+!items last week             !bestsellers yesterday
 /history                     /help
 ```
+
+`!` is easier on the phone than Telegram slash-commands. `/sales` still works. Bare `!sales` / `!items` means today.
 
 A bare month name means the most recent one. Twenty to thirty seconds per
 location.

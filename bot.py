@@ -66,7 +66,8 @@ Bare <code>!sales</code> is today. Give it 20-30 seconds.
 !items last week
 !items yesterday</pre>
 
-Name, qty sold, and dollars. Same date phrases as sales. Items you rang as
+Top 15 per shop by name, qty sold, and dollars, plus an Excel sheet of
+every item, shops side by side with totals at the bottom. Same date phrases as sales. Items you rang as
 open-price / unnamed will not show — only what is in the item list.
 
 <b>/history</b> — local daily totals
@@ -252,6 +253,17 @@ def do_items(chat_id: str, start: date, end: date, label: str) -> None:
             "chat_id": chat_id, "text": chunk,
             "parse_mode": "HTML", "disable_web_page_preview": "true",
         })
+
+    # The digest only fits the top sellers; the attachment is every item.
+    try:
+        path = sr.write_items_file(results, start, end)
+        if path:
+            notify.telegram_send_document(
+                chat_id, path, caption=f"Every item sold, {label}")
+    except Exception as e:
+        log.error("bot items: CSV attachment failed: %s", e)
+        reply(chat_id, "Couldn't attach the full item list "
+                       f"({notify._html_escape(str(e))[:200]}).")
 
 
 def do_history(chat_id: str) -> None:

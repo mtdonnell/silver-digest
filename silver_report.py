@@ -171,7 +171,9 @@ SELECTORS: dict[str, str] = {
     "report_marker":   "Gross Sales",
     # Item Sales (reportType=is) does not contain "Gross Sales". Any one of
     # these in the report frame means the items report actually rendered.
-    "items_report_markers": "Sold Quantity|Net Sales Amount|Item Sales|Avg. Price|Avg Price",
+    # The live report labels its columns "Sold Qty." and "Amt." (recon
+    # 2026-10-20), so "Sold Qty" is the one that actually matches.
+    "items_report_markers": "Sold Qty|Sold Quantity|Net Sales Amount|Avg. Price|Avg Price",
 
     # --- Export: CONFIRMED from recon --------------------------------------
     # Not a menu at all. It is a classic ASP.NET ReportViewer toolbar: a
@@ -430,6 +432,8 @@ class ItemSale:
     qty: float
     net_sales: float | None = None
     category: str = ""
+    vendor: str = ""
+    avg_price: float | None = None
 
 
 @dataclass
@@ -782,7 +786,21 @@ def toolbar_frame(page: Page) -> Frame:
     return page.main_frame
 
 
-def report_frame(page: Page) -> Frame:
+def _frame_with(page: Page, markers: list[str]) -> Frame | None:
+    """The first report-ish frame whose body contains any of `markers`."""
+    for f in page.frames:
+        if not any(h in (f.url or "") for h in FRAME_URL_HINTS):
+            continue
+        try:
+            body = f.inner_text("body")
+        except Exception:
+            continue
+        if any(m in body for m in markers):
+            return f
+    return None
+
+
+def report_frame(page: Page, markers: list[str] | None = None) -> Frame:
     """
     Return the frame that actually contains the rendered report.
 
@@ -797,21 +815,18 @@ def report_frame(page: Page) -> Frame:
     Falls back to the main frame so a portal that stops using iframes keeps
     working rather than hard-failing.
     """
-    marker = SELECTORS["report_marker"]
+    markers = markers or [SELECTORS["report_marker"]]
     candidates = [f for f in page.frames
                   if any(h in (f.url or "") for h in FRAME_URL_HINTS)]
 
     # Prefer a frame that demonstrably holds report content.
-    for f in candidates:
-        try:
-            if marker in f.inner_text("body"):
-                log.debug("report frame: %s", (f.url or "")[:80])
-                return f
-        except Exception:
-            continue
+    found = _frame_with(page, markers)
+    if found:
+        log.debug("report frame: %s", (found.url or "")[:80])
+        return found
 
     if candidates:
-        log.warning("no frame contained %r -- using first report-ish frame", marker)
+        log.warning("no frame contained %s -- using first report-ish frame", markers)
         return candidates[0]
 
     log.warning("no report iframe found -- falling back to the main frame")
@@ -857,12 +872,15 @@ def open_report(page: Page, start: date, end: date,
                      report_type, start.isoformat(), end.isoformat())
             page.goto(url, wait_until="load", timeout=60_000)
             page.wait_for_load_state("networkidle", timeout=30_000)
-            frame = report_frame(page)
-            body = frame.inner_text("body")
-            if any(m in body for m in markers):
-                log.info("direct report URL worked -- skipped the menus entirely")
-                verify_day_on_page(page, start)
-                return
+            # The Telerik viewer fills its nested report frame AFTER
+            # networkidle -- a long range takes a while -- so poll for it
+            # rather than reading once and declaring the report empty.
+            for _ in range(30):
+                if _frame_with(page, markers):
+                    log.info("direct report URL worked -- skipped the menus entirely")
+                    verify_day_on_page(page, start, markers)
+                    return
+                page.wait_for_timeout(2_000)
             log.warning("direct URL loaded but no report content "
                         "(looked for %s) -- falling back to clicking through "
                         "the UI", markers)
@@ -870,6 +888,11 @@ def open_report(page: Page, start: date, end: date,
             log.warning("direct report URL failed (%s: %s) -- falling back to "
                         "clicking through the UI", type(e).__name__, e)
 
+    if report_type != "ds":
+        # navigate_by_menu only knows the way to Store Summary; following it
+        # for any other report just times out waiting for "Gross Sales".
+        raise RuntimeError(f"report type {report_type!r} did not render from "
+                           f"the direct URL, and has no menu fallback")
     navigate_by_menu(page, start)
 
 
@@ -904,7 +927,8 @@ def navigate_by_menu(page: Page, day: date) -> None:
     verify_day_on_page(page, day)
 
 
-def verify_day_on_page(page: Page, day: date) -> None:
+def verify_day_on_page(page: Page, day: date,
+                       markers: list[str] | None = None) -> None:
     """
     Refuse to continue unless the requested date is actually on screen.
 
@@ -937,7 +961,7 @@ def verify_day_on_page(page: Page, day: date) -> None:
         day.isoformat(),                               # 2026-08-15
         day.strftime("%m/%d/%y"),                      # 08/15/26
     ]
-    text = report_frame(page).inner_text("body")
+    text = report_frame(page, markers).inner_text("body")
     if any(c in text for c in candidates):
         return
 
@@ -1139,14 +1163,74 @@ def _norm_header(cell: str) -> str:
     return re.sub(r"\s+", " ", cell.replace(".", "").strip().lower())
 
 
+def _money(cell: str) -> float | None:
+    raw = clean_number(cell)
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def _parse_item_export_headerless(rows: list[list[str]],
+                                  path: pathlib.Path) -> list[ItemSale]:
+    """
+    The layout Silver actually exports (confirmed 2026-10-20, both stores):
+    no header row, a run of blank padding columns, then per item
+
+        category, name, vendor, current price, avg price, sold qty,
+        weight qty, amt, cost, margin, <category totals x4>,
+        grand qty, grand weight, grand amt, ...
+
+    Positions are trusted only because every row also carries the report's
+    own grand total: the item amounts must add up to it to the cent, or this
+    raises instead of ranking the wrong column.
+    """
+    items: list[ItemSale] = []
+    grand_qty = grand_amt = None
+    for row in rows:
+        i = next((j for j, c in enumerate(row) if c.strip()), None)
+        if i is None or len(row) < i + 17:
+            continue
+        cat, name, vendor = (c.strip() for c in row[i:i + 3])
+        qty = _money(row[i + 5]) or 0.0
+        amt = _money(row[i + 7])
+        if not name or (qty == 0 and not amt):
+            continue
+        items.append(ItemSale(name=name, qty=qty, net_sales=amt, category=cat,
+                              vendor=vendor, avg_price=_money(row[i + 4])))
+        grand_qty, grand_amt = _money(row[i + 14]), _money(row[i + 16])
+
+    if not items and not any(c.strip() for r in rows for c in r):
+        return []                       # a day with no item sales at all
+    if not items:
+        preview = ", ".join(c.strip() for c in (rows[0] if rows else [])
+                            if c.strip())[:200]
+        raise RuntimeError(
+            f"Item Sales export matched neither a header row nor the known "
+            f"headerless layout. First row: {preview or '(empty)'}. "
+            f"File kept at {path}")
+
+    sum_qty = round(sum(it.qty for it in items), 2)
+    sum_amt = round(sum(it.net_sales or 0 for it in items), 2)
+    if grand_amt is None or abs(sum_amt - grand_amt) > 0.01 \
+            or (grand_qty is not None and abs(sum_qty - grand_qty) > 0.01):
+        raise RuntimeError(
+            f"Item Sales export columns look shifted: items add up to "
+            f"{sum_qty:g} / ${sum_amt:,.2f} but the report's grand total is "
+            f"{grand_qty} / {grand_amt}. File kept at {path}")
+
+    items.sort(key=lambda it: (-it.qty, -(it.net_sales or 0), it.name.lower()))
+    log.info("parsed headerless item export: %d items, %g units, $%.2f in %s",
+             len(items), sum_qty, sum_amt, path.name)
+    return items
+
+
 def parse_item_export(path: pathlib.Path) -> list[ItemSale]:
     """
     Pull per-item qty / net sales out of an Item Sales CSV.
 
-    Unlike Daily Summary, this parser refuses to guess a headerless layout.
-    The first live export is saved next to the others; if headers are unknown
-    it fails loudly with the header row in the log rather than ranking the
-    wrong column.
+    Silver's export has no header row (see _parse_item_export_headerless);
+    the header-matching path stays for the day it grows one.
     """
     text = path.read_text(encoding="utf-8-sig", errors="replace")
     rows = list(csv.reader(text.splitlines()))
@@ -1169,11 +1253,7 @@ def parse_item_export(path: pathlib.Path) -> list[ItemSale]:
         break
 
     if header_i < 0:
-        preview = ", ".join(_norm_header(c) for c in rows[0][:12] if c.strip())
-        raise RuntimeError(
-            f"Item Sales export had no recognisable header "
-            f"(name + qty columns). First row: {preview or '(empty)'}. "
-            f"File kept at {path}")
+        return _parse_item_export_headerless(rows, path)
 
     items: list[ItemSale] = []
     for row in rows[header_i + 1:]:
@@ -1325,7 +1405,8 @@ def run_store_items(store: Store, start: date, end: date,
             login(page, store)
             open_report(page, start, end, report_type="is")
             try:
-                result.raw_text = report_frame(page).inner_text("body")
+                result.raw_text = report_frame(
+                    page, _report_markers("is")).inner_text("body")
             except Exception:
                 result.raw_text = ""
             export = download_export(page, store, start, end, kind="is")
@@ -1372,8 +1453,10 @@ def build_items_digest(results: list[StoreResult], label: str,
             continue
         any_ok = True
         shown = r.items[:limit]
+        units = sum(it.qty for it in r.items)
+        net = sum(it.net_sales or 0 for it in r.items)
         lines.append(f"<b>{notify._html_escape(r.store)}</b> "
-                     f"({len(r.items)} items)")
+                     f"({len(r.items)} items, {units:g} sold, ${net:,.2f})")
         if not shown:
             lines.append("  (no item sales in this range — "
                          "open-price / unnamed rings will not appear)")
@@ -1390,6 +1473,118 @@ def build_items_digest(results: list[StoreResult], label: str,
     if not any_ok:
         subject = "[CHECK] " + subject
     return subject, "\n".join(lines)
+
+
+def _items_grid(stores: list[StoreResult]) -> tuple[list[list], int]:
+    """
+    Stores side by side -- Item | Qty | Net Sales per store, one blank column
+    between -- each list sorted by dollars, then a Total row for each store on
+    one shared line under the longest list, and a both-stores total under it.
+    Returns (rows, index of the store Total row). Values, not formulas, so
+    the totals show in phone previews that never recalculate a sheet.
+    """
+    width = 4 * len(stores) - 1
+    blank = lambda: [None] * width
+    head, cols = blank(), blank()
+    lists = []
+    for k, r in enumerate(stores):
+        c = 4 * k
+        head[c] = r.store
+        cols[c:c + 3] = ["Item", "Qty", "Net Sales"]
+        lists.append(sorted(r.items, key=lambda it: (-(it.net_sales or 0),
+                                                     -it.qty, it.name.lower())))
+    rows = [head, cols]
+    for i in range(max(len(l) for l in lists)):
+        row = blank()
+        for k, items in enumerate(lists):
+            if i < len(items):
+                it = items[i]
+                row[4 * k:4 * k + 3] = [it.name, it.qty, it.net_sales]
+        rows.append(row)
+    total = blank()
+    for k, items in enumerate(lists):
+        total[4 * k:4 * k + 3] = ["Total", sum(it.qty for it in items),
+                                  round(sum(it.net_sales or 0 for it in items), 2)]
+    rows += [blank(), total]
+    total_i = len(rows) - 1
+    if len(stores) > 1:
+        both = blank()
+        both[0:3] = ["All shops", sum(total[4 * k + 1] for k in range(len(stores))),
+                     round(sum(total[4 * k + 2] for k in range(len(stores))), 2)]
+        rows.append(both)
+    return rows, total_i
+
+
+def write_items_file(results: list[StoreResult], start: date,
+                     end: date) -> pathlib.Path | None:
+    """
+    Every item from every store that succeeded, in one spreadsheet. The
+    Telegram digest only has room for the top few; this is the full list.
+    Excel when openpyxl is installed, otherwise a CSV with the same layout.
+    """
+    ok = [r for r in results if r.ok and r.items]
+    if not ok:
+        return None
+    span = (start.isoformat() if start == end
+            else f"{start.isoformat()}_to_{end.isoformat()}")
+    rows, total_i = _items_grid(ok)
+    title = (f"Item Sales  {start:%m/%d/%Y}" if start == end
+             else f"Item Sales  {start:%m/%d/%Y} - {end:%m/%d/%Y}")
+    try:
+        return _write_items_xlsx(rows, total_i, title,
+                                 EXPORTS / f"{span}_items_all_stores.xlsx")
+    except Exception as e:
+        log.warning("items xlsx failed (%s: %s) -- sending CSV instead",
+                    type(e).__name__, e)
+    dest = EXPORTS / f"{span}_items_all_stores.csv"
+    with dest.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow([title])
+        for row in rows:
+            w.writerow(["" if v is None else f"{v:g}" if isinstance(v, float)
+                        and v.is_integer() else v for v in row])
+    return dest
+
+
+def _write_items_xlsx(rows: list[list], total_i: int, title: str,
+                      dest: pathlib.Path) -> pathlib.Path:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Item Sales"
+    ws.append([title])
+    ws["A1"].font = Font(bold=True, size=14)
+    for row in rows:
+        ws.append(row)
+
+    n_stores = (len(rows[0]) + 1) // 4
+    bold, fill = Font(bold=True), PatternFill("solid", fgColor="DDEBF7")
+    top = Border(top=Side(style="medium"))
+    for k in range(n_stores):
+        c = 4 * k + 1                     # 1-based first column of this store
+        ws.merge_cells(start_row=2, start_column=c, end_row=2, end_column=c + 2)
+        hdr = ws.cell(row=2, column=c)
+        hdr.font, hdr.alignment = Font(bold=True, size=12), Alignment(horizontal="center")
+        for j in range(3):
+            cell = ws.cell(row=3, column=c + j)
+            cell.font, cell.fill = bold, fill
+            ws.column_dimensions[get_column_letter(c + j)].width = (
+                38 if j == 0 else 9 if j == 1 else 13)
+        ws.column_dimensions[get_column_letter(c + 3)].width = 3
+        for r in range(4, ws.max_row + 1):
+            ws.cell(row=r, column=c + 1).number_format = "#,##0.##"
+            ws.cell(row=r, column=c + 2).number_format = '"$"#,##0.00'
+        for j in range(3):
+            cell = ws.cell(row=total_i + 2, column=c + j)
+            cell.font, cell.border = bold, top
+    for j in range(3):                    # the all-shops line, if present
+        ws.cell(row=total_i + 3, column=1 + j).font = bold
+    ws.freeze_panes = "A4"
+    wb.save(dest)
+    return dest
 
 
 # ===========================================================================

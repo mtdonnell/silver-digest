@@ -3,6 +3,10 @@
 # binaries will not match.
 playwright==1.58.0
 
+# The !items spreadsheet. Optional at run time: without it the bot sends a
+# CSV in the same layout instead.
+openpyxl==3.1.5
+
 # Needed for zoneinfo to resolve TZ=America/Chicago on systems without a
 # system tz database (notably Windows). Harmless on Linux, where the
 # Dockerfile installs the OS tzdata package instead.

@@ -47,11 +47,13 @@ import base64
 import json
 import logging
 import os
+import pathlib
 import re
 import smtplib
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from email.message import EmailMessage
 
 log = logging.getLogger("silver.notify")
@@ -339,6 +341,42 @@ def telegram_call(method: str, params: dict[str, str],
         except ValueError:
             raise RuntimeError(f"Telegram HTTP {e.code}: {detail[:200]}") from None
 
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram refused: {body.get('description')}")
+    return body
+
+
+def telegram_send_document(chat_id: str, path: pathlib.Path,
+                           caption: str = "") -> dict:
+    """Upload one file (sendDocument). Hand-rolled multipart: no extra deps."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+
+    ctype = {".xlsx": "application/vnd.openxmlformats-officedocument."
+                      "spreadsheetml.sheet"}.get(path.suffix, "text/csv")
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+    for k, v in (("chat_id", chat_id), ("caption", caption)):
+        if v:
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; '
+                         f'name="{k}"\r\n\r\n{v}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; '
+                 f'name="document"; filename="{path.name}"\r\n'
+                 f'Content-Type: {ctype}\r\n\r\n'.encode()
+                 + path.read_bytes() + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+
+    req = urllib.request.Request(
+        TELEGRAM_API.format(token=token, method="sendDocument"),
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT * 2) as resp:
+            body = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Telegram HTTP {e.code}: "
+                           f"{e.read().decode(errors='replace')[:200]}") from None
     if not body.get("ok"):
         raise RuntimeError(f"Telegram refused: {body.get('description')}")
     return body
